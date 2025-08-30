@@ -1,0 +1,11 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib", "node_modules"]
+fs_permissions = [{ access = 'read-write', path = '/'}]
+
+[rpc_endpoints]
+l1 = "http://127.0.0.1:8545/kllRYTFuKXSYgxffljUKfRrV/l1"
+l2 = "http://127.0.0.1:8545/kllRYTFuKXSYgxffljUKfRrV/l2"
+
+# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
