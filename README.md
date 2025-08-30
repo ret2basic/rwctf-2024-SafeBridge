@@ -28,51 +28,69 @@ Key changes:
 
 ### The Bug
 
-The vulnerability exists in the `L1ERC20Bridge.sol` contract's withdrawal finalization logic. The contract has an accounting mismatch between:
-1. **What it tracks**: Uses `_l2Token` parameter for internal accounting (`deposits[_l1Token][_l2Token]`)
-2. **What it verifies**: Hardcodes `L2_WETH` address in cross-domain messages
+The vulnerability exists in the `L1ERC20Bridge.sol` contract where there's a critical mismatch between:
+1. **What gets tracked**: The `deposits` mapping uses the user-controlled `_l2Token` parameter
+2. **What actually happens**: When `_l1Token == WETH`, the bridge hardcodes `L2_WETH` in the cross-chain message
 
 ### Vulnerable Code
+
+In `depositERC20()`:
 ```solidity
-function finalizeERC20Withdrawal(
-    address _l1Token,
-    address _l2Token,  // Used for accounting
-    address _from,
-    address _to,
-    uint256 _amount
-) external {
-    deposits[_l1Token][_l2Token] -= _amount;  // Tracks using _l2Token
+if (_l1Token == weth) {
+    // Records deposit with user-controlled _l2Token
+    deposits[_l1Token][_l2Token] = deposits[_l1Token][_l2Token] + _amount;
     
-    // But message verification uses hardcoded L2_WETH
-    require(
-        msg.sender == address(MESSENGER),
-        "L1ERC20Bridge: function can only be called from the messenger"
-    );
-    require(
-        MESSENGER.xDomainMessageSender() == Predeploys.L2_ERC20_BRIDGE,
-        "L1ERC20Bridge: function can only be called from the L2 bridge"
+    // But sends message with hardcoded L2_WETH!
+    bytes memory message = abi.encodeWithSelector(
+        IL2ERC20Bridge.finalizeDeposit.selector,
+        _l1Token,
+        Predeploys.L2_WETH,  // <-- Hardcoded, ignores _l2Token
+        _from,
+        _to,
+        _amount
     );
 }
 ```
 
+This means:
+- Accounting tracks: `deposits[WETH][maliciousToken] += amount`
+- But L2 receives: Real L2 WETH tokens
+
 ### Exploitation Strategy
 
-1. **Deploy Malicious Token on L2**: Create a token contract that:
-   - Returns the L1 WETH address when `l1Token()` is called
-   - Has a no-op `burn()` function that doesn't actually burn tokens
+1. **Deploy Malicious Token on L2**: 
+   ```solidity
+   contract L2MaliciousToken {
+       function l1Token() returns (address) { 
+           return L1_WETH_ADDRESS; 
+       }
+       function burn(address, uint256) external {} // No-op
+   }
+   ```
 
-2. **Deposit WETH**: Bridge WETH from L1 to L2 using the malicious token address as the L2 token
-   - This credits `deposits[WETH][maliciousToken]`
+2. **Bridge 2 WETH to L2** with `_l2Token = maliciousToken`:
+   - Credits: `deposits[WETH][maliciousToken] = 2 ether`
+   - Mints: 2 real L2 WETH to attacker (due to hardcoded address)
 
-3. **Double Withdrawal**:
-   - First: Withdraw using the malicious token address
-     - Decrements `deposits[WETH][maliciousToken]`
-     - Doesn't burn L2 WETH (due to no-op burn)
-   - Second: Withdraw using the actual L2 WETH address
-     - Uses the preserved L2 WETH balance
-     - Bridge processes this as a valid withdrawal
+3. **First Withdrawal - Using Malicious Token**:
+   - Withdraw with `_l2Token = maliciousToken`
+   - Debits: `deposits[WETH][maliciousToken] -= 2 ether`
+   - Burns: Nothing (malicious token's burn is no-op)
+   - Receives: 2 WETH on L1
+   - **Still has**: 2 L2 WETH (preserved)
 
-4. **Result**: Extract 2x the deposited amount from the bridge
+4. **Second Withdrawal - Using Real L2 WETH**:
+   - Withdraw the preserved 2 L2 WETH legitimately
+   - Burns: 2 L2 WETH (real burn)
+   - Receives: 2 more WETH on L1
+
+### Result
+- **Deposited**: 2 WETH
+- **Withdrew**: 4 WETH (2 WETH × 2 withdrawals)
+- **Net profit**: 2 WETH stolen from bridge
 
 ### Root Cause
-The bridge fails to enforce consistency between the token used for accounting and the token validated in cross-domain messages. This allows attackers to manipulate the accounting system while bypassing the burn mechanism that should prevent double-spending.
+The vulnerability stems from the inconsistency between the accounting system (which trusts user input) and the actual token operations (which use hardcoded addresses). This allows an attacker to:
+- Make one deposit that credits their malicious token in accounting
+- But receive real L2 WETH due to the hardcoded address
+- Withdraw twice: once using the accounting credit (without burning L2 WETH), and once using the actual L2 WETH
